@@ -40,15 +40,34 @@
 #endif
 #endif
 
-typedef struct VifStateCuda {
+struct VifStateCuda;
+
+typedef struct write_score_parameters_vif {
+    VmafFeatureCollector *feature_collector;
+    struct VifStateCuda *s;
+    unsigned index;
+    vif_accums *accum_host;
+} write_score_parameters_vif;
+
+#define VIF_CUDA_HOST_SLOTS 4
+
+// Each slot carries its own compute stream, device slab, and host pinned
+// buffer so frames can run in parallel without colliding on shared state.
+typedef struct VifCudaSlot {
     VifBufferCuda buf;
-    CUevent event, finished;
-    CUstream str, host_stream;
+    VmafCudaBuffer *data;
+    VmafCudaBuffer *accum_data;
+    vif_accums *accum_host;
+    write_score_parameters_vif cpu_param;
+    CUstream stream;
+    CUevent consumed;
+} VifCudaSlot;
+
+typedef struct VifStateCuda {
+    VifCudaSlot slots[VIF_CUDA_HOST_SLOTS];
+    unsigned next_slot;
     bool debug;
     double vif_enhn_gain_limit;
-    void (*filter1d_8)(VifBufferCuda *buf, uint8_t* ref_in, uint8_t* dis_in, unsigned w, unsigned h, double vif_enhn_gain_limit, CUstream stream);
-    void (*filter1d_16)(VifBufferCuda *buf,  uint16_t* ref_in, uint16_t* dis_in, unsigned w, unsigned h, int scale,
-            int bpc, double vif_enhn_gain_limit, CUstream stream);
     VmafDictionary *feature_name_dict;
     CUfunction func_filter1d_8_vertical_kernel_uint32_t_17_9,
                func_filter1d_8_horizontal_kernel_2_17_9,
@@ -61,12 +80,6 @@ typedef struct VifStateCuda {
                func_filter1d_16_horizontal_kernel_2_5_3_2,
                func_filter1d_16_horizontal_kernel_2_3_0_3;
 } VifStateCuda;
-
-typedef struct write_score_parameters_vif {
-    VmafFeatureCollector *feature_collector;
-    VifStateCuda *s;
-    unsigned index;
-} write_score_parameters_vif;
 
 static const VmafOption options[] = {
     {
@@ -91,18 +104,80 @@ static const VmafOption options[] = {
     { 0 }
 };
 
+static int init_slot_buffers(VmafFeatureExtractor *fex, VifCudaSlot *slot,
+        unsigned w, unsigned h, unsigned bpc)
+{
+    const bool hbd = bpc > 8;
+    CudaFunctions *cu_f = fex->cu_state->f;
+    VifBufferCuda *buf = &slot->buf;
+
+    int tex_alignment;
+    CHECK_CUDA(cu_f, cuDeviceGetAttribute(&tex_alignment,
+                CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT, fex->cu_state->dev));
+
+    buf->stride = tex_alignment *
+        (((w * (1 << (int)hbd) + tex_alignment - 1) / tex_alignment));
+    buf->stride_16 = ALIGN_CEIL(w * sizeof(uint16_t));
+    buf->stride_32 = ALIGN_CEIL(w * sizeof(uint32_t));
+    buf->stride_64 = ALIGN_CEIL(w * sizeof(uint64_t));
+    buf->stride_tmp = ALIGN_CEIL(w * sizeof(uint32_t));
+
+    const size_t frame_size = buf->stride * h;
+    const size_t data_sz = 2 * frame_size +
+        2 * (h * buf->stride_16) + 5 * (h * buf->stride_32) +
+        8 * (buf->stride_tmp * h);
+
+    int ret = vmaf_cuda_buffer_alloc(fex->cu_state, &slot->data, data_sz);
+    if (ret) return ret;
+    ret = vmaf_cuda_buffer_alloc(fex->cu_state, &slot->accum_data,
+            sizeof(vif_accums) * 4);
+    if (ret) return ret;
+
+    buf->data = slot->data;
+    buf->accum_data = slot->accum_data;
+    buf->accum_host = NULL;
+    buf->cpu_param_buf = NULL;
+
+    CUdeviceptr data;
+    ret = vmaf_cuda_buffer_get_dptr(slot->data, &data);
+    if (ret) return ret;
+
+    buf->ref = data; data += frame_size;
+    buf->dis = data; data += frame_size;
+    buf->mu1 = (uint16_t*)data; data += h * buf->stride_16;
+    buf->mu2 = (uint16_t*)data; data += h * buf->stride_16;
+    buf->mu1_32 = (uint32_t*)data; data += h * buf->stride_32;
+    buf->mu2_32 = (uint32_t*)data; data += h * buf->stride_32;
+    buf->ref_sq = (uint32_t*)data; data += h * buf->stride_32;
+    buf->dis_sq = (uint32_t*)data; data += h * buf->stride_32;
+    buf->ref_dis = (uint32_t*)data; data += h * buf->stride_32;
+    buf->tmp.mu1 = (uint32_t*)data; data += buf->stride_tmp * h;
+    buf->tmp.mu2 = (uint32_t*)data; data += buf->stride_tmp * h;
+    buf->tmp.ref = (uint32_t*)data; data += buf->stride_tmp * h;
+    buf->tmp.dis = (uint32_t*)data; data += buf->stride_tmp * h;
+    buf->tmp.ref_dis = (uint32_t*)data; data += buf->stride_tmp * h;
+    buf->tmp.ref_convol = (uint32_t*)data; data += buf->stride_tmp * h;
+    buf->tmp.dis_convol = (uint32_t*)data; data += buf->stride_tmp * h;
+    buf->tmp.padding = (uint32_t*)data; data += buf->stride_tmp * h;
+
+    CUdeviceptr data_accum;
+    ret = vmaf_cuda_buffer_get_dptr(slot->accum_data, &data_accum);
+    if (ret) return ret;
+    buf->accum = (int64_t*)data_accum;
+
+    return 0;
+}
+
 static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
         unsigned bpc, unsigned w, unsigned h)
 {
     VifStateCuda *s = fex->priv;
     CudaFunctions *cu_f = fex->cu_state->f;
+    (void) pix_fmt;
 
     CHECK_CUDA(cu_f, cuCtxPushCurrent(fex->cu_state->ctx));
-    CHECK_CUDA(cu_f, cuStreamCreateWithPriority(&s->str, CU_STREAM_NON_BLOCKING, 0));
-    CHECK_CUDA(cu_f, cuStreamCreateWithPriority(&s->host_stream, CU_STREAM_NON_BLOCKING, 0));
-    CHECK_CUDA(cu_f, cuEventCreate(&s->event, CU_EVENT_DEFAULT));
-    CHECK_CUDA(cu_f, cuEventCreate(&s->finished, CU_EVENT_DEFAULT));
-    // make this static
+    s->next_slot = 0;
+
     CUmodule filter1d_module;
     CHECK_CUDA(cu_f, cuModuleLoadData(&filter1d_module, filter1d_ptx));
     CHECK_CUDA(cu_f, cuModuleGetFunction(&s->func_filter1d_8_vertical_kernel_uint32_t_17_9,
@@ -126,87 +201,54 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
     CHECK_CUDA(cu_f, cuModuleGetFunction(&s->func_filter1d_16_horizontal_kernel_2_3_0_3,
                 filter1d_module, "filter1d_16_horizontal_kernel_2_3_0_3"));
 
+    int ret = 0;
+    for (unsigned i = 0; i < VIF_CUDA_HOST_SLOTS; i++) {
+        VifCudaSlot *slot = &s->slots[i];
+        slot->cpu_param.s = s;
+
+        CHECK_CUDA(cu_f, cuStreamCreateWithPriority(&slot->stream,
+                    CU_STREAM_NON_BLOCKING, 0));
+        CHECK_CUDA(cu_f, cuEventCreate(&slot->consumed, CU_EVENT_DEFAULT));
+
+        ret = init_slot_buffers(fex, slot, w, h, bpc);
+        if (ret) goto fail;
+
+        ret = vmaf_cuda_buffer_host_alloc(fex->cu_state,
+                (void**)&slot->accum_host, sizeof(vif_accums) * 4);
+        if (ret) goto fail;
+        slot->cpu_param.accum_host = slot->accum_host;
+    }
+
     CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
-
-    (void) pix_fmt;
-    const bool hbd = bpc > 8;
-
-    int tex_alignment;
-    CHECK_CUDA(cu_f, cuDeviceGetAttribute(&tex_alignment, CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT,
-                fex->cu_state->dev));
-    s->buf.stride = tex_alignment * (((w * (1 << (int)hbd) + tex_alignment - 1) / tex_alignment));
-    s->buf.stride_16 = ALIGN_CEIL(w * sizeof(uint16_t));
-    s->buf.stride_32 = ALIGN_CEIL(w * sizeof(uint32_t));
-    s->buf.stride_64 = ALIGN_CEIL(w * sizeof(uint64_t));
-    s->buf.stride_tmp =
-        ALIGN_CEIL(w * sizeof(uint32_t));
-    const size_t frame_size = s->buf.stride * h;
-    const size_t data_sz = 2 * frame_size +
-        2 * (h * s->buf.stride_16) + 5 * (h * s->buf.stride_32) + 8 * (s->buf.stride_tmp * h); // intermediater buffers
-    int ret = vmaf_cuda_buffer_alloc(fex->cu_state, &s->buf.data, data_sz);
-    if (ret) goto free_ref;
-
-    ret = vmaf_cuda_buffer_alloc(fex->cu_state, &s->buf.accum_data, sizeof(vif_accums) * 4);
-    if (ret) goto free_ref;
-
-    ret = vmaf_cuda_buffer_host_alloc(fex->cu_state, (void**)&s->buf.accum_host, sizeof(vif_accums) * 4);
-    if (ret) goto free_ref;
-
-    CUdeviceptr data;
-    ret = vmaf_cuda_buffer_get_dptr(s->buf.data, &data);
-    if (ret) goto free_ref;
-
-    s->buf.ref = data; data += frame_size;
-    s->buf.dis = data; data += frame_size;
-    s->buf.mu1 = (uint16_t*)data; data += h * s->buf.stride_16;
-    s->buf.mu2 = (uint16_t*)data; data += h * s->buf.stride_16;
-    s->buf.mu1_32 = (uint32_t*)data; data += h * s->buf.stride_32;
-    s->buf.mu2_32 = (uint32_t*)data; data += h * s->buf.stride_32;
-    s->buf.ref_sq = (uint32_t*)data; data += h * s->buf.stride_32;
-    s->buf.dis_sq = (uint32_t*)data; data += h * s->buf.stride_32;
-    s->buf.ref_dis = (uint32_t*)data; data += h * s->buf.stride_32;
-    s->buf.tmp.mu1 = (uint32_t*)data; data += s->buf.stride_tmp * h;
-    s->buf.tmp.mu2 = (uint32_t*)data; data += s->buf.stride_tmp * h;
-    s->buf.tmp.ref = (uint32_t*)data; data += s->buf.stride_tmp * h;
-    s->buf.tmp.dis = (uint32_t*)data; data += s->buf.stride_tmp * h;
-    s->buf.tmp.ref_dis = (uint32_t*)data; data += s->buf.stride_tmp * h;
-    s->buf.tmp.ref_convol = (uint32_t*)data; data += s->buf.stride_tmp  * h;
-    s->buf.tmp.dis_convol = (uint32_t*)data; data += s->buf.stride_tmp  * h;
-    s->buf.tmp.padding = (uint32_t*)data; data += s->buf.stride_tmp  * h;
-
-    CUdeviceptr data_accum;
-    ret = vmaf_cuda_buffer_get_dptr(s->buf.accum_data, &data_accum);
-    if (ret) goto free_ref;
-
-    s->buf.accum = (int64_t*)data_accum;
-
-    s->buf.cpu_param_buf = malloc(sizeof(write_score_parameters_vif));
-    write_score_parameters_vif *data_p = s->buf.cpu_param_buf;
-    data_p->s = s;
 
     s->feature_name_dict =
         vmaf_feature_name_dict_from_provided_features(fex->provided_features,
                 fex->options, s);
-    if (!s->feature_name_dict) goto free_ref;
+    if (!s->feature_name_dict) { ret = -ENOMEM; goto fail; }
     return 0;
 
-free_ref:
-    if (s->buf.data) {
-        ret |= vmaf_cuda_buffer_free(fex->cu_state, s->buf.data);
-        free(s->buf.data);
+fail:
+    for (unsigned i = 0; i < VIF_CUDA_HOST_SLOTS; i++) {
+        VifCudaSlot *slot = &s->slots[i];
+        if (slot->data) {
+            vmaf_cuda_buffer_free(fex->cu_state, slot->data);
+            free(slot->data);
+        }
+        if (slot->accum_data) {
+            vmaf_cuda_buffer_free(fex->cu_state, slot->accum_data);
+            free(slot->accum_data);
+        }
+        if (slot->accum_host) {
+            vmaf_cuda_buffer_host_free(fex->cu_state, slot->accum_host);
+        }
+        if (slot->consumed) {
+            CHECK_CUDA(cu_f, cuEventDestroy(slot->consumed));
+        }
+        if (slot->stream) {
+            CHECK_CUDA(cu_f, cuStreamDestroy(slot->stream));
+        }
     }
-    if (s->buf.accum_data) {
-        ret |= vmaf_cuda_buffer_free(fex->cu_state, s->buf.accum_data);
-        free(s->buf.accum_data);
-    }
-    if (s->buf.accum_host) {
-        ret |= vmaf_cuda_buffer_host_free(fex->cu_state, s->buf.accum_host);
-    }
-    if (s->buf.cpu_param_buf) {
-        free(s->buf.cpu_param_buf);
-    }
-
-    return -ENOMEM;
+    return ret ? ret : -ENOMEM;
 }
 
 void filter1d_8(VifStateCuda *s, VifBufferCuda *buf, uint8_t* ref_in, uint8_t* dis_in, int w, int h, double vif_enhn_gain_limit,
@@ -259,7 +301,7 @@ void filter1d_16(VifStateCuda *s, VifBufferCuda *buf, uint16_t* ref_in, uint16_t
         shift_VP_sq = 16;
         add_shift_round_VP_sq = 32768;
     }
-    
+
     struct uint2 {
         unsigned x ,y;
     } uint2;
@@ -351,7 +393,7 @@ static int write_scores(write_score_parameters_vif* data)
     unsigned index = data->index;
 
     VifScore vif;
-    vif_accums *accum = (vif_accums*)data->s->buf.accum_host;
+    vif_accums *accum = data->accum_host;
     for (unsigned scale = 0; scale < 4; ++scale) {
         vif.scale[scale].num =
             accum[scale].num_log / 2048.0 + accum[scale].x2 +
@@ -450,73 +492,86 @@ static int extract_fex_cuda(VmafFeatureExtractor *fex,
     int w = ref_pic->w[0];
     int h = dist_pic->h[0];
 
-    // this is done to ensure that the CPU does not overwrite the buffer params for 'write_scores
-    // before the GPU has finished writing to it.
-    CHECK_CUDA(cu_f, cuStreamSynchronize(s->str));
-    CHECK_CUDA(cu_f, cuCtxPushCurrent(fex->cu_state->ctx));
-    CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
-    CHECK_CUDA(cu_f, cuMemsetD8Async(s->buf.accum_data->data, 0, sizeof(vif_accums) * 4, s->str));
-    CHECK_CUDA(cu_f, cuStreamWaitEvent(vmaf_cuda_picture_get_stream(ref_pic), vmaf_cuda_picture_get_ready_event(dist_pic), CU_EVENT_WAIT_DEFAULT));
+    const unsigned slot_idx = s->next_slot;
+    s->next_slot = (s->next_slot + 1) % VIF_CUDA_HOST_SLOTS;
+    VifCudaSlot *slot = &s->slots[slot_idx];
+    // Block only on this slot's own prior use (K frames back).
+    CHECK_CUDA(cu_f, cuEventSynchronize(slot->consumed));
+
+    // Slot stream must wait for both picture uploads to complete.
+    CHECK_CUDA(cu_f, cuStreamWaitEvent(slot->stream,
+                vmaf_cuda_picture_get_ready_event(ref_pic), CU_EVENT_WAIT_DEFAULT));
+    CHECK_CUDA(cu_f, cuStreamWaitEvent(slot->stream,
+                vmaf_cuda_picture_get_ready_event(dist_pic), CU_EVENT_WAIT_DEFAULT));
+
+    CHECK_CUDA(cu_f, cuMemsetD8Async(slot->buf.accum_data->data, 0,
+                sizeof(vif_accums) * 4, slot->stream));
+
     for (unsigned scale = 0; scale < 4; ++scale) {
         if (scale > 0) {
             w /= 2; h /= 2;
         }
 
         if (ref_pic->bpc == 8 && scale == 0) {
-            filter1d_8(s, &s->buf, (uint8_t*)ref_pic->data[0], (uint8_t*)dist_pic->data[0], w, h, s->vif_enhn_gain_limit, cu_f, vmaf_cuda_picture_get_stream(ref_pic));
+            filter1d_8(s, &slot->buf,
+                    (uint8_t*)ref_pic->data[0], (uint8_t*)dist_pic->data[0],
+                    w, h, s->vif_enhn_gain_limit, cu_f, slot->stream);
         } else if (scale == 0) {
-            filter1d_16(s, &s->buf, (uint16_t*)ref_pic->data[0], (uint16_t*)dist_pic->data[0], w, h, scale, ref_pic->bpc, s->vif_enhn_gain_limit, cu_f, vmaf_cuda_picture_get_stream(ref_pic));
+            filter1d_16(s, &slot->buf,
+                    (uint16_t*)ref_pic->data[0], (uint16_t*)dist_pic->data[0],
+                    w, h, scale, ref_pic->bpc, s->vif_enhn_gain_limit,
+                    cu_f, slot->stream);
         } else {
-            filter1d_16(s, &s->buf, (uint16_t*)s->buf.ref, (uint16_t*)s->buf.dis, w, h, scale, ref_pic->bpc, s->vif_enhn_gain_limit, cu_f, s->str);
-        }
-        if(scale == 0)
-        {
-            // This event ensures the input buffer is consumed
-            CHECK_CUDA(cu_f, cuEventRecord(s->event, vmaf_cuda_picture_get_stream(ref_pic)));
-            CHECK_CUDA(cu_f, cuStreamWaitEvent(s->str, s->event, CU_EVENT_WAIT_DEFAULT));
-            CHECK_CUDA(cu_f, cuCtxPushCurrent(fex->cu_state->ctx));
-            CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
+            filter1d_16(s, &slot->buf,
+                    (uint16_t*)slot->buf.ref, (uint16_t*)slot->buf.dis,
+                    w, h, scale, ref_pic->bpc, s->vif_enhn_gain_limit,
+                    cu_f, slot->stream);
         }
     }
 
-    // log has to be divided by 2048 as log_value = log2(i*2048)  i=16384 to 65535
-    // num[0] = accum_num_log / 2048.0 + (accum_den_non_log - (accum_num_non_log /
-    // 65536.0) / (255.0*255.0)); den[0] = accum_den_log / 2048.0 +
-    vif_accums *accum = (vif_accums*)s->buf.accum_host;
-    CHECK_CUDA(cu_f, cuStreamSynchronize(s->host_stream));
-    CHECK_CUDA(cu_f, cuMemcpyDtoHAsync(accum, s->buf.accum_data->data,
-                sizeof(vif_accums) * 4, s->str));
-    CHECK_CUDA(cu_f, cuEventRecord(s->finished, s->str));
-    CHECK_CUDA(cu_f, cuStreamWaitEvent(s->host_stream, s->finished, CU_EVENT_WAIT_DEFAULT));
+    CHECK_CUDA(cu_f, cuMemcpyDtoHAsync(slot->accum_host,
+                slot->buf.accum_data->data, sizeof(vif_accums) * 4,
+                slot->stream));
 
-    write_score_parameters_vif *data = s->buf.cpu_param_buf;
-    data->feature_collector = feature_collector;
-    data->index = index;
-    CHECK_CUDA(cu_f, cuLaunchHostFunc(s->str, (CUhostFn*)write_scores, data));
+    slot->cpu_param.feature_collector = feature_collector;
+    slot->cpu_param.index = index;
+    CHECK_CUDA(cu_f, cuLaunchHostFunc(slot->stream,
+                (CUhostFn*)write_scores, &slot->cpu_param));
+    CHECK_CUDA(cu_f, cuEventRecord(slot->consumed, slot->stream));
     return 0;
 }
 
 static int close_fex_cuda(VmafFeatureExtractor *fex)
 {
     VifStateCuda *s = fex->priv;
-    CHECK_CUDA(fex->cu_state->f, cuStreamSynchronize(s->str));
-    CHECK_CUDA(fex->cu_state->f, cuEventDestroy(s->event));
-    CHECK_CUDA(fex->cu_state->f, cuEventDestroy(s->finished));
-
+    CudaFunctions *cu_f = fex->cu_state->f;
     int ret = 0;
-    if (s->buf.data) {
-        ret |= vmaf_cuda_buffer_free(fex->cu_state, s->buf.data);
-        free(s->buf.data);
-    }
-    if (s->buf.accum_data) {
-        ret |= vmaf_cuda_buffer_free(fex->cu_state, s->buf.accum_data);
-        free(s->buf.accum_data);
-    }
-    if (s->buf.accum_host) {
-        ret |= vmaf_cuda_buffer_host_free(fex->cu_state, s->buf.accum_host);
-    }
-    if (s->buf.cpu_param_buf) {
-        free(s->buf.cpu_param_buf);
+
+    for (unsigned i = 0; i < VIF_CUDA_HOST_SLOTS; i++) {
+        VifCudaSlot *slot = &s->slots[i];
+        if (slot->stream) {
+            CHECK_CUDA(cu_f, cuStreamSynchronize(slot->stream));
+            CHECK_CUDA(cu_f, cuStreamDestroy(slot->stream));
+            slot->stream = NULL;
+        }
+        if (slot->consumed) {
+            CHECK_CUDA(cu_f, cuEventDestroy(slot->consumed));
+            slot->consumed = NULL;
+        }
+        if (slot->data) {
+            ret |= vmaf_cuda_buffer_free(fex->cu_state, slot->data);
+            free(slot->data);
+            slot->data = NULL;
+        }
+        if (slot->accum_data) {
+            ret |= vmaf_cuda_buffer_free(fex->cu_state, slot->accum_data);
+            free(slot->accum_data);
+            slot->accum_data = NULL;
+        }
+        if (slot->accum_host) {
+            ret |= vmaf_cuda_buffer_host_free(fex->cu_state, slot->accum_host);
+            slot->accum_host = NULL;
+        }
     }
     ret |= vmaf_dictionary_free(&s->feature_name_dict);
     return ret;
@@ -527,8 +582,13 @@ static int flush_fex_cuda(VmafFeatureExtractor *fex,
 {
     (void)feature_collector;
     VifStateCuda *s = fex->priv;
+    CudaFunctions *cu_f = fex->cu_state->f;
 
-    CHECK_CUDA(fex->cu_state->f, cuStreamSynchronize(s->str));
+    for (unsigned i = 0; i < VIF_CUDA_HOST_SLOTS; i++) {
+        if (s->slots[i].stream) {
+            CHECK_CUDA(cu_f, cuStreamSynchronize(s->slots[i].stream));
+        }
+    }
     return 1;
 }
 

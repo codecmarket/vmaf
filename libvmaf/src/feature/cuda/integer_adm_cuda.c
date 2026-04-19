@@ -52,7 +52,7 @@ typedef struct write_score_parameters_adm {
     void *results_host;
 } write_score_parameters_adm;
 
-#define ADM_CUDA_HOST_SLOTS 4
+#define ADM_CUDA_HOST_SLOTS 2
 
 typedef struct AdmCudaSlot {
     AdmBufferCuda buf;

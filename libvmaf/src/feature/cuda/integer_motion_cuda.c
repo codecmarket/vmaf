@@ -42,7 +42,7 @@ typedef struct write_score_parameters_moco {
     uint64_t *sad_host;
 } write_score_parameters_moco;
 
-#define MOTION_CUDA_HOST_SLOTS 4
+#define MOTION_CUDA_HOST_SLOTS 2
 
 typedef struct MotionCudaSlot {
     VmafCudaBuffer *sad;

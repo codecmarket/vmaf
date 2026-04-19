@@ -49,7 +49,7 @@ typedef struct write_score_parameters_vif {
     vif_accums *accum_host;
 } write_score_parameters_vif;
 
-#define VIF_CUDA_HOST_SLOTS 4
+#define VIF_CUDA_HOST_SLOTS 2
 
 // Each slot carries its own compute stream, device slab, and host pinned
 // buffer so frames can run in parallel without colliding on shared state.

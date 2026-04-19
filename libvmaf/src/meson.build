@@ -35,11 +35,38 @@ is_cuda_enabled = get_option('enable_cuda') == true
 is_avx512_enabled = get_option('enable_avx512') == true
 is_nvtx_enabled = get_option('enable_nvtx') == true
 
-if is_nvtx_enabled    
+if is_nvtx_enabled
     cdata.set10('HAVE_NVTX', is_nvtx_enabled)
 endif
 if is_cuda_enabled
     cdata.set10('HAVE_CUDA', is_cuda_enabled)
+endif
+
+# Resolve CUDA-related dependencies early so every static_library that ends up
+# including picture.h (which pulls in ffnvcodec headers) gets the right -I
+# paths. Both the C/C++ compile jobs and the nvcc custom_targets below depend
+# on this.
+cuda_dependency = []
+common_cuda_objects = []
+cuda_inc = []
+ffnvcodec_nvcc_include = []
+
+if is_nvtx_enabled
+    cuda_dependency += declare_dependency(
+        link_with: shared_library('dl'),
+        include_directories: include_directories('/usr/local/cuda/include'))
+endif
+
+if is_cuda_enabled
+    ffnvcodec_dep = dependency('ffnvcodec',
+        version: '>=11.1.5.1',
+        required: true)
+    cuda_dependency += ffnvcodec_dep
+    ffnvcodec_includedir = ffnvcodec_dep.get_variable(pkgconfig: 'includedir',
+        default_value: '')
+    if ffnvcodec_includedir != ''
+        ffnvcodec_nvcc_include = ['-I', ffnvcodec_includedir]
+    endif
 endif
 
 if is_asm_enabled
@@ -229,6 +256,7 @@ if is_asm_enabled
           'arm64_v8',
           arm64_sources,
           include_directories : vmaf_base_include,
+          dependencies : cuda_dependency,
           c_args : vmaf_cflags_common + ['-DARCH_AARCH64']
         )
 
@@ -249,6 +277,7 @@ if is_asm_enabled
           'x86_avx2',
           x86_avx2_sources,
           include_directories : vmaf_base_include,
+          dependencies : cuda_dependency,
           c_args : ['-mavx', '-mavx2'] + vmaf_cflags_common,
       )
 
@@ -266,6 +295,7 @@ if is_asm_enabled
             'x86_avx512',
             x86_avx512_sources,
             include_directories : vmaf_base_include,
+            dependencies : cuda_dependency,
             c_args : ['-mavx512f', '-mavx512dq', '-mavx512bw', '-mavx512cd', '-mavx512dq',
                       '-mavx512vbmi', '-mavx512vl'] +
                      vmaf_cflags_common,
@@ -277,25 +307,7 @@ if is_asm_enabled
     endif
 endif
 
-cuda_dependency = []
-common_cuda_objects = []
-cuda_inc = []
-
-if is_nvtx_enabled
-    cuda_dependency += declare_dependency(
-        link_with: shared_library('dl'),
-        include_directories: include_directories('/usr/local/cuda/include'))
-endif
-
 if is_cuda_enabled
-    # Check for required CUDA headers
-    if not cc.has_header('ffnvcodec/dynlink_cuda.h')
-        error('ffnvcodec/dynlink_cuda.h not found. Please install nv-codec-headers from https://code.ffmpeg.org/FFmpeg/nv-codec-headers (commit 876af32a202d0de83bd1d36fe74ee0f7fcf86b0d or greater required).')
-    endif
-    if not cc.has_header('ffnvcodec/dynlink_loader.h')
-        error('ffnvcodec/dynlink_loader.h not found. Please install nv-codec-headers from https://code.ffmpeg.org/FFmpeg/nv-codec-headers (commit 876af32a202d0de83bd1d36fe74ee0f7fcf86b0d or greater required).')
-    endif
-
     cuda_cu_sources = {
         'adm_dwt2' : [feature_src_dir + 'cuda/integer_adm/adm_dwt2.cu'],
         'adm_cm' : [feature_src_dir + 'cuda/integer_adm/adm_cm.cu'],
@@ -380,6 +392,7 @@ if is_cuda_enabled
                 '-I', '../include',
                 '-I', '../src/feature',
                 '-I', '../src/' + cuda_dir,
+                ffnvcodec_nvcc_include,
                 '-DDEVICE_CODE',
             ] + cuda_flags
         )
@@ -416,6 +429,7 @@ if is_cuda_enabled
             include_directories('../src/cuda/'),
             cuda_inc,
         ],
+        dependencies : cuda_dependency,
         c_args : vmaf_cflags_common,
         cuda_args: cuda_flags # + ['-gencode', 'arch=compute_86,code=sm_86' ] #, '--use_fast_math']
     )

@@ -144,6 +144,7 @@ int vmaf_cuda_picture_alloc_pinned(VmafPicture *pic, enum VmafPixelFormat pix_fm
 
     err |= vmaf_picture_priv_init(pic);
     VmafPicturePrivate* priv = pic->priv;
+    priv->cuda.state = cuda_state;
     priv->cuda.ctx = cuda_state->ctx;
     err |= vmaf_picture_set_release_callback(pic, NULL, default_release_pinned_picture);
     if (err) goto free_data;

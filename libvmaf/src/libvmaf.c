@@ -1013,7 +1013,11 @@ int vmaf_read_pictures(VmafContext *vmaf, VmafPicture *ref, VmafPicture *dist,
 
     if (vmaf->prev_ref.ref)
         vmaf_picture_unref(&vmaf->prev_ref);
-    vmaf_picture_ref(&vmaf->prev_ref, ref);
+    // In CUDA device-only mode, ref points at the zero-initialized ref_host
+    // (see the HAVE_CUDA block above). Only track prev_ref when there is an
+    // actual host pic to reference.
+    if (ref && ref->ref)
+        vmaf_picture_ref(&vmaf->prev_ref, ref);
 #ifdef HAVE_CUDA
     if (ref_host.priv)
         err |= vmaf_picture_unref(&ref_host);

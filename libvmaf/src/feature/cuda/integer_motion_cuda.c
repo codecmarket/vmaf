@@ -45,17 +45,17 @@ typedef struct write_score_parameters_moco {
 #define MOTION_CUDA_HOST_SLOTS 4
 
 typedef struct MotionCudaSlot {
+    VmafCudaBuffer *sad;
     uint64_t *sad_host;
     write_score_parameters_moco cpu_param;
+    CUstream stream;
     CUevent consumed;
+    CUevent kernel_done;
 } MotionCudaSlot;
 
 typedef struct MotionStateCuda {
-    CUevent event, finished;
     CUfunction funcbpc8, funcbpc16;
-    CUstream str, host_stream;
     VmafCudaBuffer* blur[2];
-    VmafCudaBuffer* sad;
     MotionCudaSlot slots[MOTION_CUDA_HOST_SLOTS];
     unsigned next_slot;
     unsigned index;
@@ -149,21 +149,18 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
     MotionStateCuda *s = fex->priv;
     CudaFunctions *cu_f = fex->cu_state->f;
 
+    (void) pix_fmt;
+    (void) bpc;
+
     CHECK_CUDA(cu_f, cuCtxPushCurrent(fex->cu_state->ctx));
-    CHECK_CUDA(cu_f, cuStreamCreateWithPriority(&s->str, CU_STREAM_NON_BLOCKING, 0));
-    CHECK_CUDA(cu_f, cuStreamCreateWithPriority(&s->host_stream, CU_STREAM_NON_BLOCKING, 0));
-    CHECK_CUDA(cu_f, cuEventCreate(&s->event, CU_EVENT_DEFAULT));
-    CHECK_CUDA(cu_f, cuEventCreate(&s->finished, CU_EVENT_DEFAULT));
 
     CUmodule module;
     CHECK_CUDA(cu_f, cuModuleLoadData(&module, motion_score_ptx));
-
     CHECK_CUDA(cu_f, cuModuleGetFunction(&s->funcbpc16, module, "calculate_motion_score_kernel_16bpc"));
     CHECK_CUDA(cu_f, cuModuleGetFunction(&s->funcbpc8, module, "calculate_motion_score_kernel_8bpc"));
 
-    CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
-
     if (s->motion_force_zero) {
+        CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
         fex->extract = extract_force_zero;
         fex->flush = NULL;
         fex->close = NULL;
@@ -171,64 +168,81 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
     }
 
     s->calculate_motion_score = calculate_motion_score;
-
-    int ret = 0;
-
     s->score = 0;
     s->next_slot = 0;
 
+    int ret = 0;
     ret |= vmaf_cuda_buffer_alloc(fex->cu_state, &s->blur[0], sizeof(uint16_t) * w * h);
     if (ret) goto free_ref;
     ret |= vmaf_cuda_buffer_alloc(fex->cu_state, &s->blur[1], sizeof(uint16_t) * w * h);
     if (ret) goto free_ref;
-    ret |= vmaf_cuda_buffer_alloc(fex->cu_state, &s->sad, sizeof(uint64_t));
-    if (ret) goto free_ref;
 
-    CHECK_CUDA(cu_f, cuCtxPushCurrent(fex->cu_state->ctx));
     for (unsigned i = 0; i < MOTION_CUDA_HOST_SLOTS; i++) {
+        MotionCudaSlot *slot = &s->slots[i];
+        slot->cpu_param.s = s;
+
+        CHECK_CUDA(cu_f, cuStreamCreateWithPriority(&slot->stream,
+                    CU_STREAM_NON_BLOCKING, 0));
+        CHECK_CUDA(cu_f, cuEventCreate(&slot->consumed, CU_EVENT_DEFAULT));
+        CHECK_CUDA(cu_f, cuEventCreate(&slot->kernel_done, CU_EVENT_DEFAULT));
+
+        ret |= vmaf_cuda_buffer_alloc(fex->cu_state, &slot->sad, sizeof(uint64_t));
+        if (ret) goto free_ref;
+
         ret |= vmaf_cuda_buffer_host_alloc(fex->cu_state,
-                (void**)&s->slots[i].sad_host, sizeof(uint64_t));
-        if (ret) { CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL)); goto free_ref; }
-        s->slots[i].cpu_param.s = s;
-        s->slots[i].cpu_param.sad_host = s->slots[i].sad_host;
-        CHECK_CUDA(cu_f, cuEventCreate(&s->slots[i].consumed, CU_EVENT_DEFAULT));
+                (void**)&slot->sad_host, sizeof(uint64_t));
+        if (ret) goto free_ref;
+        slot->cpu_param.sad_host = slot->sad_host;
     }
+
     CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
 
     s->feature_name_dict =
         vmaf_feature_name_dict_from_provided_features(fex->provided_features,
                 fex->options, s);
-    if (!s->feature_name_dict) goto free_ref;
+    if (!s->feature_name_dict) { ret = -ENOMEM; goto free_ref; }
 
     return 0;
 
-
 free_ref:
     if (s->blur[0]) {
-        ret |= vmaf_cuda_buffer_free(fex->cu_state, s->blur[0]);
+        vmaf_cuda_buffer_free(fex->cu_state, s->blur[0]);
         free(s->blur[0]);
+        s->blur[0] = NULL;
     }
     if (s->blur[1]) {
-        ret |= vmaf_cuda_buffer_free(fex->cu_state, s->blur[1]);
+        vmaf_cuda_buffer_free(fex->cu_state, s->blur[1]);
         free(s->blur[1]);
-    }
-    if (s->sad) {
-        ret |= vmaf_cuda_buffer_free(fex->cu_state, s->sad);
-        free(s->sad);
+        s->blur[1] = NULL;
     }
     for (unsigned i = 0; i < MOTION_CUDA_HOST_SLOTS; i++) {
-        if (s->slots[i].sad_host) {
-            ret |= vmaf_cuda_buffer_host_free(fex->cu_state, s->slots[i].sad_host);
-            s->slots[i].sad_host = NULL;
+        MotionCudaSlot *slot = &s->slots[i];
+        if (slot->sad) {
+            vmaf_cuda_buffer_free(fex->cu_state, slot->sad);
+            free(slot->sad);
+            slot->sad = NULL;
         }
-        if (s->slots[i].consumed) {
-            CHECK_CUDA(cu_f, cuEventDestroy(s->slots[i].consumed));
-            s->slots[i].consumed = NULL;
+        if (slot->sad_host) {
+            vmaf_cuda_buffer_host_free(fex->cu_state, slot->sad_host);
+            slot->sad_host = NULL;
+        }
+        if (slot->consumed) {
+            CHECK_CUDA(cu_f, cuEventDestroy(slot->consumed));
+            slot->consumed = NULL;
+        }
+        if (slot->kernel_done) {
+            CHECK_CUDA(cu_f, cuEventDestroy(slot->kernel_done));
+            slot->kernel_done = NULL;
+        }
+        if (slot->stream) {
+            CHECK_CUDA(cu_f, cuStreamDestroy(slot->stream));
+            slot->stream = NULL;
         }
     }
-    ret |= vmaf_dictionary_free(&s->feature_name_dict);
+    vmaf_dictionary_free(&s->feature_name_dict);
+    CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
 
-    return -ENOMEM;
+    return ret ? ret : -ENOMEM;
 }
 
 static int flush_fex_cuda(VmafFeatureExtractor *fex,
@@ -237,8 +251,9 @@ static int flush_fex_cuda(VmafFeatureExtractor *fex,
     MotionStateCuda *s = fex->priv;
     CudaFunctions *cu_f = fex->cu_state->f;
     int ret = 0;
-    CHECK_CUDA(cu_f, cuStreamSynchronize(s->str));
-    CHECK_CUDA(cu_f, cuStreamSynchronize(s->host_stream));
+    for (unsigned i = 0; i < MOTION_CUDA_HOST_SLOTS; i++) {
+        CHECK_CUDA(cu_f, cuStreamSynchronize(s->slots[i].stream));
+    }
 
     if (s->index > 0) {
         ret = vmaf_feature_collector_append(feature_collector,
@@ -294,10 +309,8 @@ static int extract_fex_cuda(VmafFeatureExtractor *fex, VmafPicture *ref_pic,
     (void) ref_pic_90;
     (void) dist_pic_90;
 
-    // Acquire a host-state slot: wait for the callback that last used this
-    // slot to finish consuming its params/sad_host, without blocking on the
-    // most recent frames still in flight. First MOTION_CUDA_HOST_SLOTS frames
-    // pass through instantly because the events were never recorded.
+    // Acquire a slot. Wait for the prior use of this slot's host state to
+    // finish; first K frames pass through instantly (unrecorded events).
     const unsigned slot_idx = s->next_slot;
     s->next_slot = (s->next_slot + 1) % MOTION_CUDA_HOST_SLOTS;
     MotionCudaSlot *slot = &s->slots[slot_idx];
@@ -307,17 +320,30 @@ static int extract_fex_cuda(VmafFeatureExtractor *fex, VmafPicture *ref_pic,
     const unsigned src_blurred_idx = (index + 0) % 2;
     const unsigned prev_blurred_idx = (index + 1) % 2;
 
-    // Reset device SAD
-    CHECK_CUDA(cu_f, cuMemsetD8Async(s->sad->data, 0, sizeof(uint64_t), s->str));
+    // The kernel reads blur[prev] and writes blur[curr], so frame N's kernel
+    // must complete before frame N+1's kernel runs (both buffers alias across
+    // frames). Chain via the prior slot's kernel_done event.
+    const unsigned prev_slot_idx =
+        (slot_idx + MOTION_CUDA_HOST_SLOTS - 1) % MOTION_CUDA_HOST_SLOTS;
+    MotionCudaSlot *prev_slot = &s->slots[prev_slot_idx];
+    CHECK_CUDA(cu_f, cuStreamWaitEvent(slot->stream, prev_slot->kernel_done,
+                CU_EVENT_WAIT_DEFAULT));
 
-    // Compute motion score
-    CHECK_CUDA(cu_f, cuStreamWaitEvent(vmaf_cuda_picture_get_stream(ref_pic), vmaf_cuda_picture_get_ready_event(dist_pic), CU_EVENT_WAIT_DEFAULT));
-    s->calculate_motion_score(ref_pic, s->blur[src_blurred_idx], s->blur[prev_blurred_idx],
-            s->sad, ref_pic->w[0], ref_pic->h[0], ref_pic->stride[0], sizeof(uint16_t) * ref_pic->w[0],
-            ref_pic->bpc, s->funcbpc8, s->funcbpc16, cu_f, vmaf_cuda_picture_get_stream(ref_pic));
-    CHECK_CUDA(cu_f, cuEventRecord(s->event, vmaf_cuda_picture_get_stream(ref_pic)));
-    // This event ensures the input buffer is consumed
-    CHECK_CUDA(cu_f, cuStreamWaitEvent(s->str, s->event, CU_EVENT_WAIT_DEFAULT));
+    // Wait for the ref picture to be ready on this slot's stream.
+    CHECK_CUDA(cu_f, cuStreamWaitEvent(slot->stream,
+                vmaf_cuda_picture_get_ready_event(ref_pic), CU_EVENT_WAIT_DEFAULT));
+
+    // Reset per-slot SAD.
+    CHECK_CUDA(cu_f, cuMemsetD8Async(slot->sad->data, 0, sizeof(uint64_t),
+                slot->stream));
+
+    // Compute motion score on slot->stream.
+    s->calculate_motion_score(ref_pic, s->blur[src_blurred_idx],
+            s->blur[prev_blurred_idx], slot->sad,
+            ref_pic->w[0], ref_pic->h[0], ref_pic->stride[0],
+            sizeof(uint16_t) * ref_pic->w[0], ref_pic->bpc,
+            s->funcbpc8, s->funcbpc16, cu_f, slot->stream);
+    CHECK_CUDA(cu_f, cuEventRecord(slot->kernel_done, slot->stream));
 
     if (index == 0) {
         err = vmaf_feature_collector_append(feature_collector,
@@ -328,22 +354,23 @@ static int extract_fex_cuda(VmafFeatureExtractor *fex, VmafPicture *ref_pic,
                     "VMAF_integer_feature_motion_score",
                     0., index);
         }
+        // Slot had no D2H / host_func; mark consumed now so it can recycle.
+        CHECK_CUDA(cu_f, cuEventRecord(slot->consumed, slot->stream));
         return err;
     }
 
-    // Download sad into this slot's pinned host buffer.
-    CHECK_CUDA(cu_f, cuMemcpyDtoHAsync(slot->sad_host, (CUdeviceptr)s->sad->data,
-                sizeof(*slot->sad_host), s->str));
-    CHECK_CUDA(cu_f, cuEventRecord(s->finished, s->str));
-    CHECK_CUDA(cu_f, cuStreamWaitEvent(s->host_stream, s->finished, CU_EVENT_WAIT_DEFAULT));
+    // D2H of 8-byte SAD + host-fn callback, all on this slot's stream.
+    CHECK_CUDA(cu_f, cuMemcpyDtoHAsync(slot->sad_host,
+                (CUdeviceptr)slot->sad->data, sizeof(*slot->sad_host),
+                slot->stream));
 
     slot->cpu_param.feature_collector = feature_collector;
     slot->cpu_param.h = ref_pic->h[0];
     slot->cpu_param.w = ref_pic->w[0];
     slot->cpu_param.index = index;
-    CHECK_CUDA(cu_f, cuLaunchHostFunc(s->host_stream, (CUhostFn*)write_scores, &slot->cpu_param));
-    // Mark this slot's host state as free to reuse K frames from now.
-    CHECK_CUDA(cu_f, cuEventRecord(slot->consumed, s->host_stream));
+    CHECK_CUDA(cu_f, cuLaunchHostFunc(slot->stream, (CUhostFn*)write_scores,
+                &slot->cpu_param));
+    CHECK_CUDA(cu_f, cuEventRecord(slot->consumed, slot->stream));
     return 0;
 }
 
@@ -351,12 +378,14 @@ static int close_fex_cuda(VmafFeatureExtractor *fex)
 {
     MotionStateCuda *s = fex->priv;
     CudaFunctions *cu_f = fex->cu_state->f;
-    CHECK_CUDA(cu_f, cuStreamSynchronize(s->str));
-    CHECK_CUDA(cu_f, cuStreamSynchronize(s->host_stream));
-    CHECK_CUDA(cu_f, cuEventDestroy(s->event));
-    CHECK_CUDA(cu_f, cuEventDestroy(s->finished));
-
     int ret = 0;
+
+    for (unsigned i = 0; i < MOTION_CUDA_HOST_SLOTS; i++) {
+        MotionCudaSlot *slot = &s->slots[i];
+        if (slot->stream) {
+            CHECK_CUDA(cu_f, cuStreamSynchronize(slot->stream));
+        }
+    }
 
     if (s->blur[0]) {
         ret |= vmaf_cuda_buffer_free(fex->cu_state, s->blur[0]);
@@ -366,18 +395,23 @@ static int close_fex_cuda(VmafFeatureExtractor *fex)
         ret |= vmaf_cuda_buffer_free(fex->cu_state, s->blur[1]);
         free(s->blur[1]);
     }
-    if (s->sad) {
-        ret |= vmaf_cuda_buffer_free(fex->cu_state, s->sad);
-        free(s->sad);
-    }
     for (unsigned i = 0; i < MOTION_CUDA_HOST_SLOTS; i++) {
-        if (s->slots[i].sad_host) {
-            ret |= vmaf_cuda_buffer_host_free(fex->cu_state, s->slots[i].sad_host);
-            s->slots[i].sad_host = NULL;
+        MotionCudaSlot *slot = &s->slots[i];
+        if (slot->sad) {
+            ret |= vmaf_cuda_buffer_free(fex->cu_state, slot->sad);
+            free(slot->sad);
         }
-        if (s->slots[i].consumed) {
-            CHECK_CUDA(cu_f, cuEventDestroy(s->slots[i].consumed));
-            s->slots[i].consumed = NULL;
+        if (slot->sad_host) {
+            ret |= vmaf_cuda_buffer_host_free(fex->cu_state, slot->sad_host);
+        }
+        if (slot->kernel_done) {
+            CHECK_CUDA(cu_f, cuEventDestroy(slot->kernel_done));
+        }
+        if (slot->consumed) {
+            CHECK_CUDA(cu_f, cuEventDestroy(slot->consumed));
+        }
+        if (slot->stream) {
+            CHECK_CUDA(cu_f, cuStreamDestroy(slot->stream));
         }
     }
     ret |= vmaf_dictionary_free(&s->feature_name_dict);

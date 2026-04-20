@@ -9,6 +9,7 @@
 
 #include "libvmaf/picture.h"
 #include "libvmaf/libvmaf.h"
+#include "picture.h"
 #ifdef HAVE_CUDA
 #include "libvmaf/libvmaf_cuda.h"
 #endif
@@ -146,7 +147,24 @@ static void copy_picture_data(VmafPicture *pic, video_input_ycbcr ycbcr,
     }
 }
 
-static int fetch_picture(VmafContext *vmaf, video_input *vid, VmafPicture *pic, int depth)
+/* Per-stream ring of pre-allocated host pictures used by fetch_picture.
+ * Lets the main loop reuse picture buffers across frames instead of
+ * paying aligned_malloc + memset on every fetch. Depth 2 covers the
+ * worst case: on the ref stream, vmaf->prev_ref retains the previous
+ * frame's slot until the next call to vmaf_read_pictures releases it.
+ *
+ * Host data is safe to overwrite once vmaf_read_pictures returns
+ * because cuMemcpy2DAsync from pageable host memory stages through a
+ * pinned buffer synchronously on the API side before returning. */
+#define FETCH_RING_DEPTH 2
+typedef struct FetchRing {
+    VmafPicture pic[FETCH_RING_DEPTH];
+    unsigned next_idx;
+    int initialized;
+} FetchRing;
+
+static int fetch_picture(VmafContext *vmaf, video_input *vid, VmafPicture *pic,
+                         int depth, FetchRing *ring)
 {
     int ret;
     video_input_ycbcr ycbcr;
@@ -158,23 +176,47 @@ static int fetch_picture(VmafContext *vmaf, video_input *vid, VmafPicture *pic, 
     video_input_get_info(vid, &info);
 
 #ifdef VMAF_PICTURE_POOL
+    (void) ring;
     ret = vmaf_fetch_preallocated_picture(vmaf, pic);
     if (ret) {
         fprintf(stderr, "problem fetching picture from pool.\n");
         return -1;
     }
 #else
-    (void) vmaf;  // Unused when pool is disabled
-    ret = vmaf_picture_alloc(pic, pix_fmt_map(info.pixel_fmt), depth,
-                             info.pic_w, info.pic_h);
+    (void) vmaf;
+    if (!ring->initialized) {
+        for (int i = 0; i < FETCH_RING_DEPTH; i++) {
+            int err = vmaf_picture_alloc(&ring->pic[i],
+                                         pix_fmt_map(info.pixel_fmt), depth,
+                                         info.pic_w, info.pic_h);
+            if (err) {
+                for (int j = 0; j < i; j++)
+                    vmaf_picture_unref(&ring->pic[j]);
+                fprintf(stderr, "problem allocating picture.\n");
+                return -1;
+            }
+        }
+        ring->initialized = 1;
+    }
+    unsigned idx = ring->next_idx;
+    ring->next_idx = (ring->next_idx + 1) % FETCH_RING_DEPTH;
+    ret = vmaf_picture_ref(pic, &ring->pic[idx]);
     if (ret) {
-        fprintf(stderr, "problem allocating picture.\n");
+        fprintf(stderr, "problem referencing ring picture.\n");
         return -1;
     }
 #endif
 
     copy_picture_data(pic, ycbcr, &info, depth);
     return 0;
+}
+
+static void fetch_ring_close(FetchRing *ring)
+{
+    if (!ring->initialized) return;
+    for (int i = 0; i < FETCH_RING_DEPTH; i++)
+        vmaf_picture_unref(&ring->pic[i]);
+    ring->initialized = 0;
 }
 
 int main(int argc, char *argv[])
@@ -418,12 +460,13 @@ int main(int argc, char *argv[])
     }
 
     VmafPicture pic_ref, pic_dist;
+    FetchRing ring_ref = { 0 }, ring_dist = { 0 };
 
     for (unsigned i = 0; i < c.frame_skip_ref; i++)
-        fetch_picture(vmaf, &vid_ref, &pic_ref, common_bitdepth);
+        fetch_picture(vmaf, &vid_ref, &pic_ref, common_bitdepth, &ring_ref);
 
     for (unsigned i = 0; i < c.frame_skip_dist; i++)
-        fetch_picture(vmaf, &vid_dist, &pic_dist, common_bitdepth);
+        fetch_picture(vmaf, &vid_dist, &pic_dist, common_bitdepth, &ring_dist);
 
     float fps = 0.;
     const time_t t0 = clock();
@@ -434,8 +477,10 @@ int main(int argc, char *argv[])
             break;
 
         VmafPicture pic_ref, pic_dist;
-        int ret1 = fetch_picture(vmaf, &vid_ref, &pic_ref, common_bitdepth);
-        int ret2 = fetch_picture(vmaf, &vid_dist, &pic_dist, common_bitdepth);
+        int ret1 = fetch_picture(vmaf, &vid_ref, &pic_ref, common_bitdepth,
+                                 &ring_ref);
+        int ret2 = fetch_picture(vmaf, &vid_dist, &pic_dist, common_bitdepth,
+                                 &ring_dist);
 
         if (ret1 && ret2) {
             break;
@@ -484,6 +529,9 @@ int main(int argc, char *argv[])
         fprintf(stderr, "problem flushing context\n");
         return err;
     }
+
+    fetch_ring_close(&ring_ref);
+    fetch_ring_close(&ring_dist);
 
     if (!c.no_prediction) {
         for (unsigned i = 0; i < c.model_cnt; i++) {

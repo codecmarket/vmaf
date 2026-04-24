@@ -121,20 +121,36 @@ int vmaf_cuda_state_init(VmafCudaState **cu_state, VmafCudaConfiguration cfg)
     }
 
     if (cfg.cu_ctx)
-        return init_with_provided_context(c, cfg.cu_ctx);
+        err = init_with_provided_context(c, cfg.cu_ctx);
     else
-        return init_with_primary_context(c);
+        err = init_with_primary_context(c);
+    if (err) return err;
+
+    /* Bind the context on the init-calling thread so hot-path helpers
+     * invoked from the same thread (and from worker threads that call
+     * vmaf_cuda_ctx_ensure) don't need per-call push/pop. */
+    return vmaf_cuda_ctx_ensure(c);
 }
 
 int vmaf_cuda_sync(VmafCudaState *cu_state)
 {
     if (is_cudastate_empty(cu_state)) return -EINVAL;
 
-    CHECK_CUDA(cu_state->f, cuCtxPushCurrent((cu_state->ctx)));
-    int err = cu_state->f->cuCtxSynchronize();
-    CHECK_CUDA(cu_state->f, cuCtxPopCurrent(NULL));
+    return cu_state->f->cuCtxSynchronize();
+}
 
-    return err;
+int vmaf_cuda_ctx_ensure(VmafCudaState *cu_state)
+{
+    if (is_cudastate_empty(cu_state)) return -EINVAL;
+    CUcontext cur = NULL;
+    CHECK_CUDA(cu_state->f, cuCtxGetCurrent(&cur));
+    if (cur == cu_state->ctx) return 0;
+    /* cuCtxSetCurrent is not exposed via the ffnvcodec dynlink table,
+     * so we use cuCtxPushCurrent — same effect for our case (the ctx
+     * becomes current on this thread) and the one-per-thread bind
+     * pattern keeps the stack bounded. */
+    CHECK_CUDA(cu_state->f, cuCtxPushCurrent(cu_state->ctx));
+    return 0;
 }
 
 void vmaf_cuda_host_pic_track(VmafCudaState *cu_state, void *host_ptr,
@@ -240,10 +256,8 @@ int vmaf_cuda_buffer_upload_async(VmafCudaState *cu_state, VmafCudaBuffer *buf,
     if (!buf) return -EINVAL;
     if (!src) return -EINVAL;
 
-    CHECK_CUDA(cu_state->f, cuCtxPushCurrent(cu_state->ctx));
     CHECK_CUDA(cu_state->f, cuMemcpyHtoDAsync(buf->data, src, buf->size,
                                  c_stream == 0 ? c_stream : cu_state->str));
-    CHECK_CUDA(cu_state->f, cuCtxPopCurrent(NULL));
 
     return CUDA_SUCCESS;
 }
@@ -256,10 +270,8 @@ int vmaf_cuda_buffer_download_async(VmafCudaState *cu_state,
     if (!buf) return -EINVAL;
     if (!dst) return -EINVAL;
 
-    CHECK_CUDA(cu_state->f, cuCtxPushCurrent(cu_state->ctx));
     CHECK_CUDA(cu_state->f, cuMemcpyDtoHAsync(dst, buf->data, buf->size,
                                  c_stream == 0 ? c_stream : cu_state->str));
-    CHECK_CUDA(cu_state->f, cuCtxPopCurrent(NULL));
 
     return CUDA_SUCCESS;
 }

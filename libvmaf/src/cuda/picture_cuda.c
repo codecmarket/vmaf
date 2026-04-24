@@ -254,9 +254,7 @@ int vmaf_cuda_picture_synchronize(VmafPicture *pic, void *cookie)
     CudaFunctions* cu_f = priv->cuda.state->f;
     CHECK_CUDA(cu_f ,cuEventSynchronize(priv->cuda.finished));
     CHECK_CUDA(cu_f ,cuStreamSynchronize(priv->cuda.str));
-    CHECK_CUDA(cu_f ,cuCtxPushCurrent(priv->cuda.ctx));
-    CHECK_CUDA(cu_f ,cuCtxPopCurrent(NULL));
-    
+
     return 0;
 }
 

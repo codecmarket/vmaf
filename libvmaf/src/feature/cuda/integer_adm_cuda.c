@@ -1084,7 +1084,10 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
     (void) bpc;
     int ret = 0;
     CudaFunctions* cu_f = fex->cu_state->f;
-    CHECK_CUDA(cu_f, cuCtxPushCurrent(fex->cu_state->ctx));
+    {
+        int ret0 = vmaf_cuda_ctx_ensure(fex->cu_state);
+        if (ret0) return ret0;
+    }
 
     CUmodule adm_cm_module, adm_csf_den_module, adm_csf_module, adm_decouple_module, adm_dwt_module;
 
@@ -1135,8 +1138,6 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
         if (ret) goto fail;
         slot->cpu_param.results_host = slot->results_host;
     }
-
-    CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
 
     s->feature_name_dict =
         vmaf_feature_name_dict_from_provided_features(fex->provided_features,

@@ -66,6 +66,13 @@ typedef struct VmafCudaState {
 void vmaf_cuda_host_pic_track(VmafCudaState *cu_state, void *host_ptr,
                               CUevent ready);
 
+/* Ensure the calling thread's current CUDA context is `cu_state->ctx`.
+ * Cheap no-op when already bound (a single cuCtxGetCurrent read); on
+ * mismatch issues cuCtxSetCurrent. Call from worker-thread entry points
+ * and from any path that needs hot-path helpers to work without
+ * per-call push/pop bracketing. */
+int vmaf_cuda_ctx_ensure(VmafCudaState *cu_state);
+
 #define VMAF_CUDA_THREADS_PER_WARP 32
 #define VMAF_CUDA_CACHE_LINE_SIZE 128
 

@@ -152,7 +152,8 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
     (void) pix_fmt;
     (void) bpc;
 
-    CHECK_CUDA(cu_f, cuCtxPushCurrent(fex->cu_state->ctx));
+    int ret0 = vmaf_cuda_ctx_ensure(fex->cu_state);
+    if (ret0) return ret0;
 
     CUmodule module;
     CHECK_CUDA(cu_f, cuModuleLoadData(&module, motion_score_ptx));
@@ -160,7 +161,6 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
     CHECK_CUDA(cu_f, cuModuleGetFunction(&s->funcbpc8, module, "calculate_motion_score_kernel_8bpc"));
 
     if (s->motion_force_zero) {
-        CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
         fex->extract = extract_force_zero;
         fex->flush = NULL;
         fex->close = NULL;
@@ -194,8 +194,6 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
         if (ret) goto free_ref;
         slot->cpu_param.sad_host = slot->sad_host;
     }
-
-    CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
 
     s->feature_name_dict =
         vmaf_feature_name_dict_from_provided_features(fex->provided_features,
@@ -240,7 +238,6 @@ free_ref:
         }
     }
     vmaf_dictionary_free(&s->feature_name_dict);
-    CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
 
     return ret ? ret : -ENOMEM;
 }

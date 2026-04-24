@@ -175,7 +175,10 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
     CudaFunctions *cu_f = fex->cu_state->f;
     (void) pix_fmt;
 
-    CHECK_CUDA(cu_f, cuCtxPushCurrent(fex->cu_state->ctx));
+    {
+        int ret0 = vmaf_cuda_ctx_ensure(fex->cu_state);
+        if (ret0) return ret0;
+    }
     s->next_slot = 0;
 
     CUmodule filter1d_module;
@@ -218,8 +221,6 @@ static int init_fex_cuda(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt
         if (ret) goto fail;
         slot->cpu_param.accum_host = slot->accum_host;
     }
-
-    CHECK_CUDA(cu_f, cuCtxPopCurrent(NULL));
 
     s->feature_name_dict =
         vmaf_feature_name_dict_from_provided_features(fex->provided_features,

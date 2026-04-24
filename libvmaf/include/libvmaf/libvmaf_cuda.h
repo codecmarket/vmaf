@@ -102,6 +102,42 @@ int vmaf_cuda_preallocate_pictures(VmafContext *vmaf,
  */
 int vmaf_cuda_fetch_preallocated_picture(VmafContext *vmaf, VmafPicture* pic);
 
+/**
+ * Allocate a VmafPicture backed by pinned (page-locked) host memory via
+ * cuMemHostAlloc. Pinned buffers let cuMemcpy2DAsync actually run the
+ * host-to-device copy asynchronously instead of staging through a bounce
+ * buffer inside the API call. The allocation is released on the final
+ * vmaf_picture_unref via cuMemFreeHost.
+ *
+ * @param pic       Picture to initialize.
+ * @param pix_fmt   Pixel format.
+ * @param bpc       Bits per component.
+ * @param w, h      Picture dimensions in pixels.
+ * @param cu_state  CUDA state previously initialized with
+ *                  vmaf_cuda_state_init.
+ *
+ * @return 0 on success, or < 0 (a negative errno code) on error.
+ */
+int vmaf_cuda_picture_alloc_pinned(VmafPicture *pic, enum VmafPixelFormat pix_fmt,
+                                   unsigned bpc, unsigned w, unsigned h,
+                                   VmafCudaState *cu_state);
+
+/**
+ * Block until any in-flight host-to-device upload whose source was
+ * `host_pic` has completed. Intended for tools that recycle host
+ * picture buffers: once the source-side read is done, the host
+ * buffer can be safely overwritten. Safe to call for a pic that has
+ * never been uploaded (no-op) or when CUDA is not active (no-op).
+ *
+ * @param vmaf     VMAF context with an imported CUDA state.
+ * @param host_pic The host-side VmafPicture that was most recently
+ *                 passed to vmaf_read_pictures.
+ *
+ * @return 0 on success, or < 0 (a negative errno code) on error.
+ */
+int vmaf_cuda_wait_host_picture_consumed(VmafContext *vmaf,
+                                         VmafPicture *host_pic);
+
 #ifdef __cplusplus
 }
 #endif

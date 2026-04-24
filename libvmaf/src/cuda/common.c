@@ -137,6 +137,26 @@ int vmaf_cuda_sync(VmafCudaState *cu_state)
     return err;
 }
 
+void vmaf_cuda_host_pic_track(VmafCudaState *cu_state, void *host_ptr,
+                              CUevent ready)
+{
+    if (is_cudastate_empty(cu_state)) return;
+    if (!host_ptr) return;
+
+    for (unsigned i = 0; i < VMAF_CUDA_HOST_PIC_SLOTS; i++) {
+        if (cu_state->host_pic_slots[i].host_ptr == host_ptr) {
+            cu_state->host_pic_slots[i].ready = ready;
+            return;
+        }
+    }
+
+    const unsigned idx = cu_state->host_pic_next;
+    cu_state->host_pic_next =
+        (cu_state->host_pic_next + 1) % VMAF_CUDA_HOST_PIC_SLOTS;
+    cu_state->host_pic_slots[idx].host_ptr = host_ptr;
+    cu_state->host_pic_slots[idx].ready = ready;
+}
+
 int vmaf_cuda_release(VmafCudaState *cu_state)
 {
     if (is_cudastate_empty(cu_state)) return CUDA_SUCCESS;

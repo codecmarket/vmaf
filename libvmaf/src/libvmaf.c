@@ -264,6 +264,27 @@ int vmaf_cuda_fetch_preallocated_picture(VmafContext *vmaf, VmafPicture* pic)
     }
 }
 
+int vmaf_cuda_wait_host_picture_consumed(VmafContext *vmaf,
+                                         VmafPicture *host_pic)
+{
+    if (!vmaf) return -EINVAL;
+    if (!host_pic) return -EINVAL;
+    if (!host_pic->data[0]) return 0;
+
+    VmafCudaState *cu_state = &vmaf->cuda.state;
+    if (!cu_state->ctx) return 0;
+
+    for (unsigned i = 0; i < VMAF_CUDA_HOST_PIC_SLOTS; i++) {
+        if (cu_state->host_pic_slots[i].host_ptr != host_pic->data[0])
+            continue;
+        CUevent ready = cu_state->host_pic_slots[i].ready;
+        if (!ready) return 0;
+        CHECK_CUDA(cu_state->f, cuEventSynchronize(ready));
+        return 0;
+    }
+    return 0;
+}
+
 static int set_fex_cuda_state(VmafFeatureExtractorContext *fex_ctx,
                               VmafContext *vmaf)
 {
@@ -856,6 +877,8 @@ static int translate_picture_host(VmafContext *vmaf, VmafPicture *pic,
                     "problem moving host pic into cuda device buffer\n");
             return err;
         }
+        vmaf_cuda_host_pic_track(&vmaf->cuda.state, pic->data[0],
+                                 vmaf_cuda_picture_get_ready_event(pic_device));
         break;
     default:
         return -EINVAL;

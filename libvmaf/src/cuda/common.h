@@ -37,13 +37,34 @@ typedef struct VmafCudaBuffer {
 
 typedef struct CudaFunctions CudaFunctions;
 
+/* Small fixed-capacity table that pairs a host-picture data pointer with
+ * the CUevent that fires when its most recent H2D upload has completed.
+ * Populated inside translate_picture_host after each
+ * vmaf_cuda_picture_upload_async; consumed by
+ * vmaf_cuda_wait_host_picture_consumed so tools that recycle host buffers
+ * (after pinning them) can wait for the specific upload that last read a
+ * given slot before overwriting it. */
+#define VMAF_CUDA_HOST_PIC_SLOTS 8
+typedef struct VmafCudaHostPicSlot {
+    void *host_ptr;
+    CUevent ready;
+} VmafCudaHostPicSlot;
+
 typedef struct VmafCudaState {
     CUcontext ctx;
     CUstream str;
     CUdevice dev;
     CudaFunctions *f;
     int release_ctx;
+    VmafCudaHostPicSlot host_pic_slots[VMAF_CUDA_HOST_PIC_SLOTS];
+    unsigned host_pic_next;
 } VmafCudaState;
+
+/* Record that `host_ptr` is the source of an H2D upload whose completion
+ * is signaled by `ready`. Overwrites the prior entry for the same host_ptr
+ * if any; otherwise evicts round-robin. */
+void vmaf_cuda_host_pic_track(VmafCudaState *cu_state, void *host_ptr,
+                              CUevent ready);
 
 #define VMAF_CUDA_THREADS_PER_WARP 32
 #define VMAF_CUDA_CACHE_LINE_SIZE 128

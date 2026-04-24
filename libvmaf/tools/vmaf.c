@@ -153,14 +153,22 @@ static void copy_picture_data(VmafPicture *pic, video_input_ycbcr ycbcr,
  * worst case: on the ref stream, vmaf->prev_ref retains the previous
  * frame's slot until the next call to vmaf_read_pictures releases it.
  *
- * Host data is safe to overwrite once vmaf_read_pictures returns
- * because cuMemcpy2DAsync from pageable host memory stages through a
- * pinned buffer synchronously on the API side before returning. */
+ * On the CUDA path the slots are allocated pinned (via
+ * vmaf_cuda_picture_alloc_pinned) so cuMemcpy2DAsync can run the H2D
+ * copy truly asynchronously. The pinned case breaks the "safe to
+ * overwrite once vmaf_read_pictures returns" guarantee that pageable
+ * staging used to provide, so before overwriting a slot we call
+ * vmaf_cuda_wait_host_picture_consumed to block on the upload's
+ * ready event. The non-CUDA path keeps the pageable-staging semantics
+ * unchanged. */
 #define FETCH_RING_DEPTH 2
 typedef struct FetchRing {
     VmafPicture pic[FETCH_RING_DEPTH];
     unsigned next_idx;
     int initialized;
+#ifdef HAVE_CUDA
+    VmafCudaState *cu_state;
+#endif
 } FetchRing;
 
 static int fetch_picture(VmafContext *vmaf, video_input *vid, VmafPicture *pic,
@@ -183,12 +191,25 @@ static int fetch_picture(VmafContext *vmaf, video_input *vid, VmafPicture *pic,
         return -1;
     }
 #else
+#ifndef HAVE_CUDA
     (void) vmaf;
+#endif
     if (!ring->initialized) {
         for (int i = 0; i < FETCH_RING_DEPTH; i++) {
-            int err = vmaf_picture_alloc(&ring->pic[i],
+            int err;
+#ifdef HAVE_CUDA
+            if (ring->cu_state) {
+                err = vmaf_cuda_picture_alloc_pinned(&ring->pic[i],
+                                                     pix_fmt_map(info.pixel_fmt),
+                                                     depth, info.pic_w, info.pic_h,
+                                                     ring->cu_state);
+            } else
+#endif
+            {
+                err = vmaf_picture_alloc(&ring->pic[i],
                                          pix_fmt_map(info.pixel_fmt), depth,
                                          info.pic_w, info.pic_h);
+            }
             if (err) {
                 for (int j = 0; j < i; j++)
                     vmaf_picture_unref(&ring->pic[j]);
@@ -200,6 +221,17 @@ static int fetch_picture(VmafContext *vmaf, video_input *vid, VmafPicture *pic,
     }
     unsigned idx = ring->next_idx;
     ring->next_idx = (ring->next_idx + 1) % FETCH_RING_DEPTH;
+
+#ifdef HAVE_CUDA
+    if (ring->cu_state) {
+        int werr = vmaf_cuda_wait_host_picture_consumed(vmaf, &ring->pic[idx]);
+        if (werr) {
+            fprintf(stderr, "problem waiting on prior upload\n");
+            return -1;
+        }
+    }
+#endif
+
     ret = vmaf_picture_ref(pic, &ring->pic[idx]);
     if (ret) {
         fprintf(stderr, "problem referencing ring picture.\n");
@@ -300,12 +332,13 @@ int main(int argc, char *argv[])
     }
 
 #ifdef HAVE_CUDA
-    VmafCudaState *cu_state;
+    VmafCudaState *cu_state = NULL;
     VmafCudaConfiguration cuda_cfg = { 0 };
     if (c.gpumask != ((unsigned)~0)) {
         err = vmaf_cuda_state_init(&cu_state, cuda_cfg);
         if (err) {
             fprintf(stderr, "problem during vmaf_cuda_state_init, using CPU\n");
+            cu_state = NULL;
         } else {
             err |= vmaf_cuda_import_state(vmaf, cu_state);
             if (err) {
@@ -461,6 +494,10 @@ int main(int argc, char *argv[])
 
     VmafPicture pic_ref, pic_dist;
     FetchRing ring_ref = { 0 }, ring_dist = { 0 };
+#ifdef HAVE_CUDA
+    ring_ref.cu_state = cu_state;
+    ring_dist.cu_state = cu_state;
+#endif
 
     for (unsigned i = 0; i < c.frame_skip_ref; i++)
         fetch_picture(vmaf, &vid_ref, &pic_ref, common_bitdepth, &ring_ref);
